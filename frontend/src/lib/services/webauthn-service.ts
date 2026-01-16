@@ -14,6 +14,18 @@ class WebAuthnService extends APIService {
 	finishLogin = async (body: AuthenticationResponseJSON) =>
 		(await this.api.post(`/webauthn/login/finish`, body)).data as User;
 
+	createCrossDeviceLogin = async () => (await this.api.post(`/webauthn/cross-device/start`)).data;
+
+	getCrossDeviceLoginOptions = async (code: string) =>
+		(await this.api.get(`/webauthn/cross-device/login/start`, { params: { code } })).data;
+
+	finishCrossDeviceLogin = async (code: string, body: AuthenticationResponseJSON) =>
+		(await this.api.post(`/webauthn/cross-device/login/finish`, body, { params: { code } }))
+			.data as User;
+
+	getCrossDeviceLoginStatus = async (exchangeToken: string) =>
+		(await this.api.get(`/webauthn/cross-device/status`, { params: { exchangeToken } })).data;
+
 	logout = async () => {
 		await this.api.post(`/webauthn/logout`);
 		userStore.clearUser();

@@ -35,7 +35,7 @@
 			alternativeSignInButton.href = '/login/alternative';
 			alternativeSignInButton.label = m.alternative_sign_in_methods();
 		} else {
-			alternativeSignInButton.href = '/login/alternative/code';
+			alternativeSignInButton.href = '/login/alternative/cross-device';
 			alternativeSignInButton.label = m.sign_in_with_login_code();
 		}
 

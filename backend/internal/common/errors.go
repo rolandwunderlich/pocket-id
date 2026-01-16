@@ -45,6 +45,27 @@ func (e *DeviceCodeInvalid) Error() string {
 }
 func (e *DeviceCodeInvalid) HttpStatusCode() int { return 400 }
 
+type CrossDeviceLoginInvalidError struct{}
+
+func (e *CrossDeviceLoginInvalidError) Error() string {
+	return "Cross-device login request is invalid"
+}
+func (e *CrossDeviceLoginInvalidError) HttpStatusCode() int { return http.StatusBadRequest }
+
+type CrossDeviceLoginExpiredError struct{}
+
+func (e *CrossDeviceLoginExpiredError) Error() string {
+	return "Cross-device login request has expired"
+}
+func (e *CrossDeviceLoginExpiredError) HttpStatusCode() int { return http.StatusGone }
+
+type CrossDeviceLoginAlreadyUsedError struct{}
+
+func (e *CrossDeviceLoginAlreadyUsedError) Error() string {
+	return "Cross-device login request has already been used"
+}
+func (e *CrossDeviceLoginAlreadyUsedError) HttpStatusCode() int { return http.StatusBadRequest }
+
 type TokenInvalidError struct{}
 
 func (e *TokenInvalidError) Error() string {

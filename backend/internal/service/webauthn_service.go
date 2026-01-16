@@ -19,6 +19,12 @@ import (
 	"github.com/pocket-id/pocket-id/backend/internal/utils"
 )
 
+const (
+	crossDeviceLoginTTL                 = 3 * time.Minute
+	crossDeviceLoginCodeLength          = 16
+	crossDeviceLoginExchangeTokenLength = 16
+)
+
 type WebAuthnService struct {
 	db               *gorm.DB
 	webAuthn         *webauthn.WebAuthn
@@ -490,4 +496,257 @@ func (s *WebAuthnService) createReauthenticationToken(ctx context.Context, tx *g
 	}
 
 	return token, nil
+}
+
+// CreateCrossDeviceLogin initializes a short-lived cross-device login exchange.
+// Returns the persisted DB row and the plaintext exchange token that the requester client will poll with.
+func (s *WebAuthnService) CreateCrossDeviceLogin(ctx context.Context, ipAddress, userAgent string) (model.WebauthnCrossDeviceLogin, string, error) {
+	code, err := utils.GenerateRandomAlphanumericString(crossDeviceLoginCodeLength)
+	if err != nil {
+		return model.WebauthnCrossDeviceLogin{}, "", err
+	}
+
+	exchangeToken, err := utils.GenerateRandomAlphanumericString(crossDeviceLoginExchangeTokenLength)
+	if err != nil {
+		return model.WebauthnCrossDeviceLogin{}, "", err
+	}
+
+	crossDeviceLogin := model.WebauthnCrossDeviceLogin{
+		Code:             code,
+		ExchangeToken:    utils.CreateSha256Hash(exchangeToken),
+		ExpiresAt:        datatype.DateTime(time.Now().Add(crossDeviceLoginTTL)),
+		RequesterIP:      ipAddress,
+		RequesterUserAgent: userAgent,
+	}
+
+	if err := s.db.WithContext(ctx).Create(&crossDeviceLogin).Error; err != nil {
+		return model.WebauthnCrossDeviceLogin{}, "", err
+	}
+
+	return crossDeviceLogin, exchangeToken, nil
+}
+
+// BeginCrossDeviceLogin issues WebAuthn request options for the authenticator after validating the cross-device login request.
+func (s *WebAuthnService) BeginCrossDeviceLogin(ctx context.Context, code string) (*model.WebauthnCrossDeviceLogin, *model.PublicKeyCredentialRequestOptions, error) {
+	tx := s.db.Begin()
+	defer func() {
+		tx.Rollback()
+	}()
+
+	var crossDeviceLogin model.WebauthnCrossDeviceLogin
+	err := tx.
+		WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		First(&crossDeviceLogin, "code = ?", code).
+		Error
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load cross-device login: %w", err)
+	}
+
+	if crossDeviceLogin.ConsumedAt != nil {
+		return nil, nil, &common.CrossDeviceLoginAlreadyUsedError{}
+	}
+
+	now := time.Now()
+	if crossDeviceLogin.CompletedAt == nil && now.After(crossDeviceLogin.ExpiresAt.ToTime()) {
+		return nil, nil, &common.CrossDeviceLoginExpiredError{}
+	}
+
+	if crossDeviceLogin.CompletedAt != nil {
+		return nil, nil, &common.CrossDeviceLoginAlreadyUsedError{}
+	}
+
+	options, session, err := s.webAuthn.BeginDiscoverableLogin()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	sessionToStore := &model.WebauthnSession{
+		ExpiresAt:        datatype.DateTime(session.Expires),
+		Challenge:        session.Challenge,
+		UserVerification: string(session.UserVerification),
+	}
+
+	err = tx.
+		WithContext(ctx).
+		Create(&sessionToStore).
+		Error
+	if err != nil {
+		return nil, nil, err
+	}
+
+	crossDeviceLogin.SessionID = &sessionToStore.ID
+	if err := tx.WithContext(ctx).Save(&crossDeviceLogin).Error; err != nil {
+		return nil, nil, err
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return nil, nil, err
+	}
+
+	return &crossDeviceLogin, &model.PublicKeyCredentialRequestOptions{
+		Response:  options.Response,
+		SessionID: sessionToStore.ID,
+		Timeout:   s.webAuthn.Config.Timeouts.Registration.Timeout,
+	}, nil
+}
+
+// CompleteCrossDeviceLogin validates the phone WebAuthn assertion and marks the cross-device login as completed.
+func (s *WebAuthnService) CompleteCrossDeviceLogin(ctx context.Context, code string, sessionID string, credentialAssertionData *protocol.ParsedCredentialAssertionData, ipAddress, userAgent string) (model.User, error) {
+	tx := s.db.Begin()
+	defer func() {
+		tx.Rollback()
+	}()
+
+	var crossDeviceLogin model.WebauthnCrossDeviceLogin
+	err := tx.
+		WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		First(&crossDeviceLogin, "code = ?", code).
+		Error
+	if err != nil {
+		return model.User{}, fmt.Errorf("failed to load cross-device login: %w", err)
+	}
+
+	now := time.Now()
+	if crossDeviceLogin.CompletedAt != nil || crossDeviceLogin.ConsumedAt != nil {
+		return model.User{}, &common.CrossDeviceLoginAlreadyUsedError{}
+	}
+
+	if now.After(crossDeviceLogin.ExpiresAt.ToTime()) {
+		return model.User{}, &common.CrossDeviceLoginExpiredError{}
+	}
+
+	if crossDeviceLogin.SessionID == nil || *crossDeviceLogin.SessionID != sessionID {
+		return model.User{}, &common.CrossDeviceLoginInvalidError{}
+	}
+
+	user, err := s.validateLoginSession(ctx, tx, sessionID, credentialAssertionData)
+	if err != nil {
+		return model.User{}, err
+	}
+
+	crossDeviceLogin.UserID = &user.ID
+	completedAt := datatype.DateTime(now)
+	crossDeviceLogin.CompletedAt = &completedAt
+	crossDeviceLogin.AuthenticatorIP = &ipAddress
+	crossDeviceLogin.AuthenticatorUserAgent = &userAgent
+
+	if err := tx.WithContext(ctx).Save(&crossDeviceLogin).Error; err != nil {
+		return model.User{}, err
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return model.User{}, err
+	}
+
+	return user, nil
+}
+
+// PollCrossDeviceLoginStatus returns the current cross-device login status and, if completed, generates an access token.
+func (s *WebAuthnService) PollCrossDeviceLoginStatus(ctx context.Context, exchangeToken string) (model.WebauthnCrossDeviceLogin, *model.User, string, error) {
+	hashed := utils.CreateSha256Hash(exchangeToken)
+
+	tx := s.db.Begin()
+	defer func() {
+		tx.Rollback()
+	}()
+
+	var crossDeviceLogin model.WebauthnCrossDeviceLogin
+	err := tx.
+		WithContext(ctx).
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Preload("User").
+		First(&crossDeviceLogin, "exchange_token = ?", hashed).
+		Error
+	if err != nil {
+		return model.WebauthnCrossDeviceLogin{}, nil, "", fmt.Errorf("failed to load cross-device login: %w", err)
+	}
+
+	/*if crossDeviceLogin.ExchangeToken != hashed {
+		return model.WebauthnCrossDeviceLogin{}, nil, "", &common.CrossDeviceLoginInvalidError{}
+	}*/
+
+	now := time.Now()
+	if crossDeviceLogin.CompletedAt == nil && now.After(crossDeviceLogin.ExpiresAt.ToTime()) {
+		return crossDeviceLogin, nil, "", &common.CrossDeviceLoginExpiredError{}
+	}
+
+	if crossDeviceLogin.CompletedAt == nil {
+		return crossDeviceLogin, nil, "", nil
+	}
+
+	if crossDeviceLogin.ConsumedAt != nil {
+		return crossDeviceLogin, nil, "", &common.CrossDeviceLoginAlreadyUsedError{}
+	}
+
+	if crossDeviceLogin.User == nil {
+		return crossDeviceLogin, nil, "", &common.CrossDeviceLoginInvalidError{}
+	}
+
+	token, err := s.jwtService.GenerateAccessToken(*crossDeviceLogin.User)
+	if err != nil {
+		return crossDeviceLogin, nil, "", err
+	}
+
+	conssumedAt := datatype.DateTime(now)
+	crossDeviceLogin.ConsumedAt = &conssumedAt
+
+	s.auditLogService.CreateNewSignInWithEmail(ctx, crossDeviceLogin.RequesterIP, crossDeviceLogin.RequesterUserAgent, crossDeviceLogin.User.ID, tx)
+
+	if err := tx.WithContext(ctx).Save(&crossDeviceLogin).Error; err != nil {
+		return crossDeviceLogin, nil, "", err
+	}
+
+	if err := tx.Commit().Error; err != nil {
+		return crossDeviceLogin, nil, "", err
+	}
+
+	return crossDeviceLogin, crossDeviceLogin.User, token, nil
+}
+
+// validateLoginSession validates a WebAuthn login session without issuing an access token.
+func (s *WebAuthnService) validateLoginSession(ctx context.Context, tx *gorm.DB, sessionID string, credentialAssertionData *protocol.ParsedCredentialAssertionData) (model.User, error) {
+	// Load & delete the session row
+	var storedSession model.WebauthnSession
+	err := tx.
+		WithContext(ctx).
+		Clauses(clause.Returning{}).
+		Delete(&storedSession, "id = ?", sessionID).
+		Error
+	if err != nil {
+		return model.User{}, fmt.Errorf("failed to load WebAuthn session: %w", err)
+	}
+
+	session := webauthn.SessionData{
+		Challenge: storedSession.Challenge,
+		Expires:   storedSession.ExpiresAt.ToTime(),
+	}
+
+	var user *model.User
+	_, err = s.webAuthn.ValidateDiscoverableLogin(func(_, userHandle []byte) (webauthn.User, error) {
+		innerErr := tx.
+			WithContext(ctx).
+			Preload("Credentials").
+			First(&user, "id = ?", string(userHandle)).
+			Error
+		if innerErr != nil {
+			return nil, innerErr
+		}
+		return user, nil
+	}, session, credentialAssertionData)
+
+	if err != nil {
+		return model.User{}, err
+	}
+
+	if user == nil {
+		return model.User{}, &common.CrossDeviceLoginInvalidError{}
+	}
+
+	if user.Disabled {
+		return model.User{}, &common.UserDisabledError{}
+	}
+
+	return *user, nil
 }
